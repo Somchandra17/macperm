@@ -1,0 +1,439 @@
+#!/bin/zsh
+# macperm: allow, deny or reset macOS privacy (TCC) permissions for an app from fzf menus.
+# It writes straight into the TCC databases, so it only works with SIP disabled.
+
+emulate -R zsh
+setopt pipe_fail no_unset extended_glob
+
+readonly SQLITE=/usr/bin/sqlite3
+readonly PLISTBUDDY=/usr/libexec/PlistBuddy
+readonly SYS_DB="/Library/Application Support/com.apple.TCC/TCC.db"
+readonly BACKUP_DIR="$HOME/TCC-backups"
+readonly SELF=${0:A}
+
+# key|TCC service|label|database ("user" = your per-user DB, "system" = root DB, needs your password)
+typeset -ra PERMS=(
+  "microphone|kTCCServiceMicrophone|Microphone|user"
+  "camera|kTCCServiceCamera|Camera|user"
+  "screen-recording|kTCCServiceScreenCapture|Screen & System Audio Recording|system"
+  "system-audio|kTCCServiceAudioCapture|System Audio Recording Only|user"
+  "accessibility|kTCCServiceAccessibility|Accessibility|system"
+  "full-disk-access|kTCCServiceSystemPolicyAllFiles|Full Disk Access|system"
+  "input-monitoring|kTCCServiceListenEvent|Input Monitoring|system"
+  "developer-tools|kTCCServiceDeveloperTool|Developer Tools|system"
+  "app-management|kTCCServiceSystemPolicyAppBundles|App Management|user"
+  "bluetooth|kTCCServiceBluetoothAlways|Bluetooth|user"
+  "contacts|kTCCServiceAddressBook|Contacts|user"
+  "calendar|kTCCServiceCalendar|Calendars|user"
+  "reminders|kTCCServiceReminders|Reminders|user"
+  "photos|kTCCServicePhotos|Photos|user"
+  "speech|kTCCServiceSpeechRecognition|Speech Recognition|user"
+  "media|kTCCServiceMediaLibrary|Media & Apple Music|user"
+  "desktop|kTCCServiceSystemPolicyDesktopFolder|Desktop Folder|user"
+  "documents|kTCCServiceSystemPolicyDocumentsFolder|Documents Folder|user"
+  "downloads|kTCCServiceSystemPolicyDownloadsFolder|Downloads Folder|user"
+  "network-volumes|kTCCServiceSystemPolicyNetworkVolumes|Network Volumes|user"
+  "removable-volumes|kTCCServiceSystemPolicyRemovableVolumes|Removable Volumes|user"
+)
+
+typeset -a P_KEYS SEL_KEYS
+typeset -A P_SERVICE P_LABEL P_SCOPE STATUS
+for _p in $PERMS; do
+  _f=("${(@s:|:)_p}")
+  P_KEYS+=($_f[1]); P_SERVICE[$_f[1]]=$_f[2]; P_LABEL[$_f[1]]=$_f[3]; P_SCOPE[$_f[1]]=$_f[4]
+done
+unset _p _f
+
+typeset USER_DB="" T_NAME="" T_CLIENT="" T_CODE="" ACTION=""
+typeset -i T_CTYPE=0 DRY_RUN=0 YES=0
+typeset -a FZF_OPTS=(--height=~90% --layout=reverse --border=rounded --info=inline --cycle)
+
+usage() {
+  cat <<'EOF'
+macperm - allow, deny or reset macOS privacy permissions (microphone, camera, ...) for an app.
+
+Usage:
+  macperm                          pick the app, the permissions and the action from menus
+  macperm --app APP --perm KEY[,KEY...] --allow|--deny|--reset [--yes]
+  macperm --status APP             show what an app is currently allowed
+  macperm --list                   list the permission keys
+
+APP can be an app name ("Dia"), a bundle ID (company.thebrowser.dia), a path to a .app,
+or a command-line tool (a path, or a command name on your PATH).
+
+Options:
+  -a, --app APP         the app to change
+  -p, --perm KEYS       comma-separated permission keys, e.g. microphone,camera
+      --allow           allow the permissions
+      --deny            deny them
+      --reset           remove the entries, so the app asks again
+  -n, --dry-run         print the database changes without making them
+  -y, --yes             skip the confirmation question
+  -s, --status APP      show an app's current permissions
+  -l, --list            list permission keys
+      --list-apps       list the apps the menu offers
+  -h, --help            show this help
+
+Notes:
+  * SIP must be disabled: the script writes straight into the macOS privacy (TCC) databases.
+  * Screen recording, Accessibility, Full Disk Access, Input Monitoring and Developer Tools
+    are in the system database and need your admin password.
+  * Every change is backed up first to ~/TCC-backups/. To undo, use --reset, or restore a backup:
+      /usr/bin/sqlite3 "<database>" ".restore '<backup file>'"
+  * Quit and reopen the app afterwards so it picks up the change.
+EOF
+}
+
+die() { print -u2 -r -- "macperm: $*"; exit 1 }
+
+sq() { print -r -- "'${1//\'/\'\'}'" }
+
+ask_yes() {
+  (( YES )) && return 0
+  local reply rc
+  read -q "reply?$1"; rc=$?
+  print
+  return $rc
+}
+
+find_user_db() {
+  local pid db
+  if [[ -n ${MACPERM_USER_DB:-} && -f $MACPERM_USER_DB ]]; then
+    print -r -- $MACPERM_USER_DB; return 0
+  fi
+  # macOS 27 keeps the per-user DB in a protected container, so ask the running tccd where it is.
+  for pid in $(pgrep -u $UID -x tccd 2>/dev/null); do
+    db=$(lsof -p $pid -Fn 2>/dev/null | sed -n 's|^n\(.*/com\.apple\.TCC/TCC\.db\)$|\1|p')
+    db=${db%%$'\n'*}
+    [[ -n $db && -f $db ]] && { print -r -- $db; return 0 }
+  done
+  for db in "$HOME/Library/Application Support/com.apple.TCC/TCC.db" \
+            /private/var/containers/Data/ProtectedSystem/*/Data/Library/Application\ Support/com.apple.TCC/TCC.db(N-.U); do
+    [[ -f $db ]] && { print -r -- $db; return 0 }
+  done
+  return 1
+}
+
+check_sip() {
+  local s
+  s=$(csrutil status 2>/dev/null)
+  if [[ $s == *"status: enabled."* ]]; then
+    die "SIP is enabled, so macOS won't let this script edit the privacy databases. Use System Settings instead."
+  fi
+}
+
+list_apps() {
+  local app id name
+  for app in /Applications/*.app(N) /Applications/*/*.app(N) $HOME/Applications/*.app(N) \
+             /System/Applications/*.app(N) /System/Applications/Utilities/*.app(N); do
+    id=$($PLISTBUDDY -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist" 2>/dev/null) || continue
+    [[ -n $id ]] || continue
+    name=${${app:t}%.app}
+    name=${name//[$'‎‏']/}
+    print -r -- "$name"$'\t'"$id"$'\t'"$app"
+  done | sort -f -t$'\t' -k1,1 | awk -F'\t' '!seen[$2]++'
+}
+
+resolve_target() {
+  local p=${1:-}
+  [[ -e $p ]] || { print -u2 -r -- "macperm: not found: $p"; return 1 }
+  p=${p:A}
+  if [[ -d $p && $p == *.app ]]; then
+    T_CLIENT=$($PLISTBUDDY -c 'Print :CFBundleIdentifier' "$p/Contents/Info.plist" 2>/dev/null)
+    [[ -n $T_CLIENT ]] || { print -u2 -r -- "macperm: $p has no bundle identifier"; return 1 }
+    T_CTYPE=0; T_CODE=$p
+    T_NAME=${${p:t}%.app}; T_NAME=${T_NAME//[$'‎‏']/}
+  elif [[ -f $p && -x $p ]]; then
+    T_CLIENT=$p; T_CTYPE=1; T_CODE=$p; T_NAME=${p:t}
+  else
+    print -u2 -r -- "macperm: $p is not an app bundle or an executable"; return 1
+  fi
+}
+
+resolve_app_arg() {
+  local arg=${1:-} line cmd
+  arg=${arg/#\~/$HOME}
+  [[ -n $arg ]] || { print -u2 "macperm: no app given"; return 1 }
+  if [[ $arg == */* ]]; then resolve_target "$arg"; return; fi
+  line=$(list_apps | awk -F'\t' -v q="$arg" 'BEGIN { q = tolower(q) } tolower($2) == q || tolower($1) == q { print; exit }')
+  if [[ -n $line ]]; then resolve_target "${line##*$'\t'}"; return; fi
+  cmd=$(whence -p -- "$arg" 2>/dev/null)
+  if [[ -n $cmd ]]; then resolve_target "$cmd"; return; fi
+  print -u2 -r -- "macperm: no app or command called '$arg' (use its name, bundle ID or path)"
+  return 1
+}
+
+load_status() {
+  local db svc val
+  STATUS=()
+  for db in $USER_DB $SYS_DB; do
+    [[ -r $db ]] || continue
+    while IFS='|' read -r svc val; do
+      [[ -n $svc ]] && STATUS[$svc]=$val
+    done < <($SQLITE -readonly "$db" "SELECT service, auth_value FROM access WHERE client=$(sq $T_CLIENT) AND client_type=$T_CTYPE;" 2>/dev/null)
+  done
+}
+
+status_word() {
+  case ${1:-} in
+    2) print allowed ;;
+    0) print denied ;;
+    3) print limited ;;
+    "") print "not set" ;;
+    *) print "value $1" ;;
+  esac
+}
+
+print_status() {
+  local k svc
+  local -a ks=("$@")
+  (( $#ks )) || ks=($P_KEYS)
+  load_status
+  print -r -- "$T_NAME"
+  print -r -- "$T_CLIENT"
+  print
+  for k in $ks; do
+    svc=$P_SERVICE[$k]
+    printf '  %-34s %s\n' "$P_LABEL[$k]" "$(status_word ${STATUS[$svc]:-})"
+  done
+}
+
+csreq_hex() {
+  local req tmp hex=""
+  req=$(codesign -d -r- "$1" 2>&1 | sed -n 's/^#* *designated => //p')
+  [[ -n $req ]] || return 1
+  tmp=$(mktemp -t macperm) || return 1
+  if print -r -- "$req" | csreq -r- -b "$tmp" 2>/dev/null; then
+    hex=$(xxd -p "$tmp" | tr -d '\n')
+  fi
+  rm -f "$tmp"
+  [[ -n $hex ]] && print -r -- $hex
+}
+
+pick_app() {
+  local apps sel target input
+  print -u2 "Scanning applications..."
+  apps=$(list_apps)
+  sel=$({ print -r -- "+ Other: a command-line tool or an app somewhere else"$'\t'"-"$'\t'"__other__"; print -r -- $apps; } |
+    fzf $FZF_OPTS --delimiter=$'\t' --with-nth=1,2 --tabstop=36 \
+      --prompt='App > ' \
+      --header='Pick the app to change. Type to search, Enter to choose, Esc to quit.' \
+      --preview="${(q)SELF} --status {3}" --preview-window='right,45%,wrap')
+  [[ -n $sel ]] || return 1
+  target=${sel##*$'\t'}
+  if [[ $target == __other__ ]]; then
+    read -r "input?Path or command name (you can drag a file here from Finder): "
+    input=${input##[[:space:]]#}; input=${input%%[[:space:]]#}
+    input=${input#[\"\']}; input=${input%[\"\']}
+    input=${input//\\ / }
+    resolve_app_arg "$input"
+  else
+    resolve_target "$target"
+  fi
+}
+
+pick_perms() {
+  local lines="" k svc note sel
+  load_status
+  for k in $P_KEYS; do
+    svc=$P_SERVICE[$k]
+    note=""; [[ $P_SCOPE[$k] == system ]] && note="needs password"
+    lines+=$(printf '%-34s %-9s %s' "$P_LABEL[$k]" "$(status_word ${STATUS[$svc]:-})" "$note")$'\t'$k$'\n'
+  done
+  sel=$(print -rn -- $lines |
+    fzf $FZF_OPTS --multi --delimiter=$'\t' --with-nth=1 \
+      --bind='space:toggle,ctrl-a:select-all,ctrl-d:deselect-all' \
+      --marker='✓' --prompt="$T_NAME > " \
+      --header=$'Space: mark/unmark   Enter: apply to all marked   Ctrl-A/Ctrl-D: mark/unmark all   Esc: quit\nPERMISSION                         NOW')
+  [[ -n $sel ]] || return 1
+  SEL_KEYS=(${${(f)sel}##*$'\t'})
+}
+
+pick_action() {
+  local sel labels=()
+  local k; for k in $SEL_KEYS; labels+=($P_LABEL[$k])
+  sel=$(printf '%s\t%s\n' \
+      "Allow" allow \
+      "Deny" deny \
+      "Reset (remove the entry so the app asks again)" reset |
+    fzf $FZF_OPTS --delimiter=$'\t' --with-nth=1 --prompt='Action > ' \
+      --header="$T_NAME: ${(j:, :)labels}")
+  [[ -n $sel ]] || return 1
+  ACTION=${sel##*$'\t'}
+}
+
+backup_db() {
+  local scope=$1 ts dest
+  mkdir -p $BACKUP_DIR || return 1
+  ts=$(date +%Y%m%d-%H%M%S)
+  if [[ $scope == system ]]; then
+    dest="$BACKUP_DIR/system-TCC-$ts.db"
+    sudo $SQLITE "$SYS_DB" ".backup $(sq $dest)" && sudo chown $UID "$dest"
+  else
+    dest="$BACKUP_DIR/user-TCC-$ts.db"
+    $SQLITE "$USER_DB" ".backup $(sq $dest)"
+  fi || { print -u2 "macperm: couldn't back up the $scope database, so nothing was changed."; return 1 }
+  print -r -- "Backup saved: $dest"
+}
+
+restart_tccd() {
+  local ok=1
+  if (( $1 )); then launchctl kickstart -k gui/$UID/com.apple.tccd 2>/dev/null || ok=0; fi
+  if (( $2 )); then sudo launchctl kickstart -k system/com.apple.tccd 2>/dev/null || ok=0; fi
+  (( ok )) || print "Couldn't restart the privacy service. If the change doesn't apply, restart your Mac."
+}
+
+apply_changes() {
+  local k svc stmt val="" csreq="NULL" hex user_sql="" sys_sql=""
+  case $ACTION in
+    allow) val=2 ;;
+    deny) val=0 ;;
+  esac
+
+  if [[ $ACTION != reset ]]; then
+    if hex=$(csreq_hex $T_CODE); then
+      csreq="X'$hex'"
+    else
+      print "Warning: $T_NAME has no valid code signature, so the entry can't be tied to it and macOS may ignore it."
+      ask_yes "Write it anyway? [y/N] " || return 1
+    fi
+  fi
+
+  for k in $SEL_KEYS; do
+    svc=$P_SERVICE[$k]
+    if [[ $ACTION == reset ]]; then
+      stmt="DELETE FROM access WHERE service=$(sq $svc) AND client=$(sq $T_CLIENT) AND client_type=$T_CTYPE;"
+    else
+      stmt="INSERT OR REPLACE INTO access (service,client,client_type,auth_value,auth_reason,auth_version,csreq,flags) VALUES ($(sq $svc),$(sq $T_CLIENT),$T_CTYPE,$val,3,1,$csreq,0);"
+    fi
+    if [[ $P_SCOPE[$k] == system ]]; then sys_sql+=$stmt$'\n'; else user_sql+=$stmt$'\n'; fi
+  done
+
+  if (( DRY_RUN )); then
+    print "Dry run, nothing changed. These statements would run:"
+    [[ -n $user_sql ]] && { print -r -- "-- $USER_DB"; print -rn -- $user_sql }
+    [[ -n $sys_sql ]] && { print -r -- "-- $SYS_DB (with sudo)"; print -rn -- $sys_sql }
+    return 0
+  fi
+
+  if [[ -n $sys_sql ]]; then
+    print "Some of these are in the system database, so macOS needs your admin password."
+    sudo -v || return 1
+  fi
+  if [[ -n $user_sql ]]; then
+    backup_db user || return 1
+    $SQLITE "$USER_DB" "BEGIN; $user_sql COMMIT;" ||
+      { print -u2 "macperm: writing to your privacy database failed."; return 1 }
+  fi
+  if [[ -n $sys_sql ]]; then
+    backup_db system || return 1
+    sudo $SQLITE "$SYS_DB" "BEGIN; $sys_sql COMMIT;" ||
+      { print -u2 "macperm: writing to the system privacy database failed."; return 1 }
+  fi
+  restart_tccd $(( ${#user_sql} > 0 )) $(( ${#sys_sql} > 0 ))
+}
+
+offer_relaunch() {
+  local i
+  (( T_CTYPE == 0 )) || return 0
+  [[ $T_CLIENT == [A-Za-z0-9.-]## ]] || return 0
+  ps -axo command= | grep -qF -- "$T_CODE/Contents/MacOS/" || return 0
+  ask_yes "$T_NAME is running. Quit and reopen it now so it picks up the change? [y/N] " || {
+    print "Quit and reopen $T_NAME yourself when you're ready."; return 0
+  }
+  osascript -e "tell application id \"$T_CLIENT\" to quit" >/dev/null 2>&1
+  for i in {1..30}; do
+    ps -axo command= | grep -qF -- "$T_CODE/Contents/MacOS/" || break
+    sleep 0.5
+  done
+  if ps -axo command= | grep -qF -- "$T_CODE/Contents/MacOS/"; then
+    print "$T_NAME didn't quit (it may be asking you to confirm). Quit it yourself, then reopen it."
+  else
+    open -b "$T_CLIENT" && print "Reopened $T_NAME."
+  fi
+}
+
+main() {
+  local app_arg="" perm_arg="" status_arg="" k
+  local -a keys
+  while (( $# )); do
+    case $1 in
+      -a|--app)    [[ -n ${2:-} ]] || die "$1 needs an app"; app_arg=$2; shift 2 ;;
+      -p|--perm|--perms) [[ -n ${2:-} ]] || die "$1 needs permission keys"; perm_arg=$2; shift 2 ;;
+      --allow)     ACTION=allow; shift ;;
+      --deny)      ACTION=deny; shift ;;
+      --reset)     ACTION=reset; shift ;;
+      -s|--status) [[ -n ${2:-} ]] || die "$1 needs an app"; status_arg=$2; shift 2 ;;
+      -n|--dry-run) DRY_RUN=1; shift ;;
+      -y|--yes)    YES=1; shift ;;
+      -l|--list)
+        for k in $P_KEYS; printf '%-20s %-34s %s\n' $k "$P_LABEL[$k]" "${${P_SCOPE[$k]:#user}:+(needs password)}"
+        exit 0 ;;
+      --list-apps) list_apps | awk -F'\t' '{ printf "%-36s %s\n", $1, $2 }'; exit 0 ;;
+      -h|--help)   usage; exit 0 ;;
+      *)           die "unknown option: $1 (see --help)" ;;
+    esac
+  done
+
+  USER_DB=$(find_user_db) || USER_DB=""
+  export MACPERM_USER_DB=$USER_DB
+
+  if [[ -n $status_arg ]]; then
+    if [[ $status_arg == __other__ ]]; then
+      print "Choose this to type the path of a command-line tool"
+      print "or an app outside the Applications folders."
+      exit 0
+    fi
+    if [[ $status_arg == */* ]]; then resolve_target "$status_arg" || exit 1
+    else resolve_app_arg "$status_arg" || exit 1; fi
+    print_status
+    exit 0
+  fi
+
+  [[ -n $USER_DB ]] || die "couldn't find your per-user privacy database."
+  (( DRY_RUN )) || check_sip
+  if [[ -z $app_arg || -z $perm_arg || -z $ACTION ]]; then
+    whence -p fzf >/dev/null || die "the menus need fzf: brew install fzf"
+  fi
+
+  if [[ -n $app_arg ]]; then
+    resolve_app_arg "$app_arg" || exit 1
+  else
+    pick_app || { print "Cancelled."; exit 0 }
+  fi
+
+  if [[ -n $perm_arg ]]; then
+    keys=(${(s:,:)perm_arg})
+    for k in $keys; do
+      (( ${+P_SERVICE[$k]} )) || die "unknown permission '$k' (see --list)"
+    done
+    SEL_KEYS=($keys)
+  else
+    pick_perms || { print "Cancelled."; exit 0 }
+  fi
+
+  if [[ -z $ACTION ]]; then
+    pick_action || { print "Cancelled."; exit 0 }
+  fi
+
+  print
+  print -r -- "App:          $T_NAME ($T_CLIENT)"
+  print -r -- "Action:       ${(C)ACTION}"
+  print -r -- "Permissions:"
+  for k in $SEL_KEYS; do
+    print -r -- "  - $P_LABEL[$k]${${P_SCOPE[$k]:#user}:+ (needs password)}"
+  done
+  print
+  ask_yes "Apply these changes? [y/N] " || { print "Cancelled."; exit 0 }
+
+  apply_changes || exit 1
+  (( DRY_RUN )) && exit 0
+
+  print
+  print "Done. Current settings:"
+  print_status $SEL_KEYS
+  print
+  offer_relaunch
+}
+
+main "$@"
